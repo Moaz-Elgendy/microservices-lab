@@ -118,3 +118,11 @@ enough to confirm each service boots and connects.
 
 Good luck with the lab — ping me when you're ready for help on the
 Dockerfiles or the K8s manifests.
+
+## Kubernetes Configuration
+
+This project includes Kubernetes configuration files located in the `~/easyk8s` directory:
+
+- `~/easyk8s/client-node.yml`: Configuration for the client node.
+- `~/easyk8s/client-pod.yml`: Configuration for the client pod.
+
