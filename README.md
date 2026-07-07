@@ -1,128 +1,173 @@
-# Microservice Lab — Fibonacci Calculator (K8s learning project)
+# Microservices Lab — Fibonacci Calculator on Kubernetes
 
-## Architecture / data flow
+A hands-on lab for learning Kubernetes by deploying a small multi-service
+application: a React client, an Express API, a Node.js worker, Postgres, and
+Redis — all wired together with Kubernetes Deployments, Services, an
+Ingress, and a PersistentVolumeClaim, with images built and pushed
+automatically via GitHub Actions.
 
-```
-[ browser ]
-     |
-     v
-[ nginx ] --/-------------> serves client's built static files directly
-     |                      (client/dist copied into the nginx image at build time -
-     |                       there is no running client container/pod)
-     |
-     +----/api/*-----------> [ server (Express, port 5000) ]
-                                    |         |
-                                    v         v
-                              [ postgres ] [ redis ] <----- publish/subscribe -----> [ worker ]
-```
+## What it does
 
-The client is a build-time artifact, not a runtime service — `npm run build`
-produces `client/dist/`, and your nginx Dockerfile copies that into the
-image (typically `/usr/share/nginx/html`). So in K8s you'll end up with 3
-running Deployments (nginx, server, worker) plus postgres and redis — not 4.
+You submit a number (0–40) in the browser. The API stores it in Postgres and
+publishes it to Redis. A separate worker picks it up, calculates the
+Fibonacci value, and writes the result back to Redis. The client polls both
+data sources and shows:
 
-1. User types a number in the **client** (served by nginx as static HTML/JS).
-2. Client POSTs it to `/api/values` (nginx routes this to **server**).
-3. **server**:
-   - stores the raw number in **postgres** (table `values`)
-   - sets a placeholder in **redis** hash `values`
-   - publishes the number on the redis `insert` pub/sub channel
-4. **worker** is subscribed to the `insert` channel, computes the Fibonacci
-   value (deliberately with slow naive recursion — good for observing scaling
-   behavior later), and writes the result back into the same redis hash.
-5. Client polls `/api/values/all` (postgres — "numbers we've seen") and
-   `/api/values/current` (redis — "calculated results") every 2s.
+- every index it has ever received (from **Postgres**)
+- the calculated result for each index (from **Redis**)
 
-## Folder structure
+## Architecture
 
 ```
-client/   React + Vite app (talks only to /api/*, never to server directly)
-          -> built with `npm run build`, output copied into the nginx image
-server/   Express API (talks to postgres + redis)
-worker/   Node process (subscribes to redis, computes fibonacci)
-nginx/    Serves the built client static files + proxies /api -> server
+                        ┌─────────────────────────┐
+                        │   Ingress (nginx-ingress) │
+                        └────────────┬─────────────┘
+                     /                              /api/*
+                     │                                  │
+                     ▼                                  ▼
+        ┌─────────────────────────┐      ┌─────────────────────────┐
+        │  client (nginx + React) │      │   server (Express API)  │
+        │  Deployment, 3 replicas │      │  Deployment, 3 replicas │
+        └─────────────────────────┘      └────────────┬────────────┘
+                                                        │
+                                        ┌───────────────┴───────────────┐
+                                        ▼                               ▼
+                          ┌──────────────────────┐        ┌──────────────────────┐
+                          │  postgres (1 replica) │        │   redis (1 replica)  │
+                          │  + PersistentVolume   │        │  pub/sub "insert"    │
+                          └──────────────────────┘        └───────────┬──────────┘
+                                                                       │
+                                                                       ▼
+                                                          ┌──────────────────────┐
+                                                          │   worker (1 replica)  │
+                                                          │  computes fibonacci   │
+                                                          └──────────────────────┘
 ```
 
-## Environment variables the apps expect
+The **client is not a raw React dev server** — its Docker image is a
+multi-stage build: `npm run build` produces static files, and those are
+served by nginx inside the client container. The standalone `nginx/` folder
+in this repo (with its own Dockerfiles and configs) is only used for local
+`docker-compose` testing; inside the actual Kubernetes cluster, routing is
+handled by the **ingress-nginx controller** via `ingress-service.yml`, not by
+that container.
 
-**server**
-| Var | Default | Notes |
-|---|---|---|
-| `PGUSER` | postgres | |
-| `PGHOST` | postgres | should match your Postgres K8s Service name |
-| `PGDATABASE` | postgres | |
-| `PGPASSWORD` | postgres_password | put this in a K8s Secret |
-| `PGPORT` | 5432 | |
-| `REDIS_HOST` | redis | should match your Redis K8s Service name |
-| `REDIS_PORT` | 6379 | |
-| `PORT` | 5000 | |
+## Repo structure
 
-**worker**
-| Var | Default |
-|---|---|
-| `REDIS_HOST` | redis |
-| `REDIS_PORT` | 6379 |
+```
+client/         React app, built + served via nginx (see client/Dockerfile)
+server/         Express API — talks to Postgres and Redis
+worker/         Node process — subscribes to Redis, computes Fibonacci
+nginx/          Reverse proxy config, used only for local docker-compose runs
+config_k8s/     All Kubernetes manifests (Deployments, Services, Ingress, PVC)
+.github/        CI/CD workflow — builds and pushes images to Docker Hub
+docker-compose.dev.yml   Local dev environment (no Kubernetes needed)
+```
 
-**client**
-No env vars needed — it only ever calls relative `/api/...` paths, so nginx
-handles all the service discovery. It's built once (`npm run build`) into
-static files; nothing reads env vars at runtime since there is no runtime.
+## Kubernetes resources
 
-## Running it locally without Docker (sanity check first)
+| Resource | Kind | Replicas | Notes |
+|---|---|---|---|
+| `client-deployment` | Deployment | 3 | nginx serving the built React app |
+| `client-cluster-ip-service` | Service (ClusterIP) | — | port 80 |
+| `server-deployment` | Deployment | 3 | Express API, env-configured for Postgres/Redis |
+| `server-cluster-ip-service` | Service (ClusterIP) | — | port 5000 |
+| `worker-deployment` | Deployment | 1 | Fibonacci calculator, subscribes to Redis |
+| `postgres-deployment` | Deployment | 1 | backed by a PVC, password from a Secret |
+| `postgres-cluster-ip-service` | Service (ClusterIP) | — | port 5432 |
+| `redis-deployment` | Deployment | 1 | in-memory, no persistence |
+| `redis-cluster-ip-service` | Service (ClusterIP) | — | port 6379 |
+| `database-persistent-volume-claim` | PVC | — | 2Gi, `ReadWriteOnce` |
+| `ingress-service` | Ingress | — | routes `/` → client, `/api/*` → server |
+
+Secrets (`pgpassword`) are created manually and are **not** committed to the
+repo — see [Setup](#setup) below.
+
+## CI/CD
+
+`.github/workflows/deploy.yml` builds and pushes fresh images for `client`,
+`server`, and `worker` to Docker Hub on every push to `main`. The
+`config_k8s/*-deployment.yml` files pull those same image names
+(`mk0230/multi-client`, `mk0230/multi-server`, `mk0230/multi-worker`), so
+redeploying is just:
 
 ```bash
-# terminal 1 - postgres & redis, easiest via docker for now
-docker run -d --name postgres -e POSTGRES_PASSWORD=postgres_password -p 5432:5432 postgres
-docker run -d --name redis -p 6379:6379 redis
-
-# terminal 2
-cd server && npm install && PGPASSWORD=postgres_password npm start
-
-# terminal 3
-cd worker && npm install && npm start
-
-# terminal 4 (dev mode only - hits real vite dev server on :3000,
-# unrelated to how nginx will serve it in prod)
-cd client && npm install && npm run dev
+kubectl rollout restart deployment client-deployment server-deployment worker-deployment
 ```
 
-Open the client at http://localhost:3000 and submit a number — the API calls
-will fail until you also run nginx or point axios elsewhere, but this is
-enough to confirm each service boots and connects.
+## Setup (Docker Desktop Kubernetes)
 
-## Your next steps (the actual learning exercise)
+1. Enable Kubernetes in Docker Desktop (Settings → Kubernetes → Enable).
+2. Create the Postgres password secret:
+   ```bash
+   kubectl create secret generic pgpassword --from-literal PGPASSWORD=yourpassword
+   ```
+3. Install the ingress-nginx controller (Docker Desktop doesn't ship one by default):
+   ```bash
+   kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.1/deploy/static/provider/cloud/deploy.yaml
+   ```
+4. Apply all manifests:
+   ```bash
+   kubectl apply -f config_k8s
+   ```
+5. Visit `http://localhost` in your browser.
 
-1. **Dockerfiles**:
-   - `server` and `worker`: standard single-stage Node Dockerfiles
-     (`COPY package*.json`, `npm install`, `COPY .`, `CMD ["node", "index.js"]`).
-   - `nginx`: this is the interesting one — a **multi-stage build**.
-     Stage 1 uses a `node` image to `npm install && npm run build` the
-     `client/` folder (producing `client/dist/`). Stage 2 starts `FROM nginx`,
-     `COPY`s `nginx/default.conf` into `/etc/nginx/conf.d/`, and `COPY`s
-     the `dist/` output from stage 1 into `/usr/share/nginx/html`.
-2. **docker-compose.yml** — wire the pieces together: nginx, server, worker,
-   postgres, redis (5 services now, since client is baked into nginx) and
-   confirm it works with plain Docker before touching K8s.
-3. **Kubernetes manifests** — good progression:
-   - `Deployment` + `Service` (ClusterIP) for server, worker, redis
-   - `Deployment` + `Service` (ClusterIP) + `PersistentVolumeClaim` for postgres
-   - `ConfigMap` for non-secret env vars (PGHOST, REDIS_HOST, etc.)
-   - `Secret` for `PGPASSWORD`
-   - `Deployment` + `Service` (NodePort or LoadBalancer) or an `Ingress` for
-     nginx as your entrypoint — this is now the only externally-reachable pod
-   - Try scaling `worker` replicas and watch how throughput changes —
-     the naive recursive fibonacci makes this very visible
-4. Later: liveness/readiness probes (there's already a `/healthz` route on
-   the server to hook up), resource limits, HPA (Horizontal Pod Autoscaler)
-   on the worker based on CPU.
+## Local development without Kubernetes
 
-Good luck with the lab — ping me when you're ready for help on the
-Dockerfiles or the K8s manifests.
+```bash
+docker-compose -f docker-compose.dev.yml up --build
+```
 
-## Kubernetes Configuration
+## Screenshots
 
-This project includes Kubernetes configuration files located in the `~/easyk8s` directory:
+### 1. The app running
+![App UI](screenshots/app-ui.png)
 
-- `~/easyk8s/client-node.yml`: Configuration for the client node.
-- `~/easyk8s/client-pod.yml`: Configuration for the client pod.
+Submitting a number, with the "seen indexes" (Postgres) and "calculated
+results" (Redis) lists populated.
 
+### 2. Pods, services, and deployments
+![kubectl get all](screenshots/kubectl-get-all.png)
+
+`kubectl get pods,deployments,services -o wide` — shows all replicas
+running and healthy, with client/server at 3 replicas each and
+worker/postgres/redis at 1.
+
+### 3. Ingress routing
+![Ingress](screenshots/ingress-describe.png)
+
+`kubectl describe ingress ingress-service` — confirms the `/` and `/api/*`
+paths are correctly wired to the `client` and `server` ClusterIP Services.
+
+### 4. Worker logs
+![Worker logs](screenshots/worker-logs.png)
+
+`kubectl logs deployment/worker-deployment` — shows the worker receiving an
+index over the Redis `insert` channel and publishing back the calculated
+Fibonacci value.
+
+### 5. Scaling the worker
+![Scaling worker](screenshots/worker-scaling.png)
+
+Before/after of `kubectl scale deployment worker-deployment --replicas=3`,
+showing the extra worker pods coming up. Good visual for demonstrating
+horizontal scaling.
+
+### 6. GitHub Actions pipeline
+![CI/CD pipeline](screenshots/github-actions.png)
+
+A successful run of `deploy.yml` building and pushing all three images to
+Docker Hub.
+
+## What I learned / practiced
+
+- Splitting an app into independently deployable services with their own
+  Dockerfiles and lifecycles
+- ClusterIP Services for internal-only communication vs. Ingress for the
+  single external entrypoint
+- Passing configuration via environment variables so the same image works
+  across Docker Compose and Kubernetes with different service hostnames
+- Using Secrets for credentials instead of hardcoding them in manifests
+- PersistentVolumeClaims for stateful services (Postgres) vs. ephemeral
+  in-memory ones (Redis)
+- Automating image builds and pushes with GitHub Actions
